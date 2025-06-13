@@ -1,0 +1,9 @@
+[package]
+name = "cfg_construction_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capstone = "0.13.0"
+goblin = "0.9.3"
+petgraph = "0.8.2"
