@@ -1,17 +1,18 @@
-mod read_binary;
-
-use capstone::{self, arch::{BuildsCapstone, BuildsCapstoneSyntax}, Insn};
+use capstone::{Capstone, Insn};
+use capstone::arch::x86::{X86Insn, X86OperandType};
+use capstone::arch::{BuildsCapstone, BuildsCapstoneSyntax, DetailsArchInsn};
+use petgraph::graph::{Graph};
+use petgraph::Directed;
+use std::collections::{HashSet, HashMap};
 use std::path::Path;
 
+mod read_binary;
+
+/// Basic block structure
 struct BasicBlock<'a> {
-    start_address: u64, 
-    end_address: u64,
+    start: u64,
+    end: u64,
     instructions: Vec<&'a Insn<'a>>,
-}
-
-
-fn is_unconditional_jump(id: u32) -> bool {
-    id == capstone::arch::x86::X86Insn::X86_INS_JMP as u32
 }
 
 fn is_conditional_jump(id: u32) -> bool {
@@ -27,152 +28,148 @@ fn is_conditional_jump(id: u32) -> bool {
     id == capstone::arch::x86::X86Insn::X86_INS_JGE as u32
 }
 
+fn is_unconditional_jump(id: u32) -> bool {
+    id == X86Insn::X86_INS_JMP as u32
+}
+
 fn is_terminator(id: u32) -> bool {
-    if is_unconditional_jump(id) {
-        return true;
-    }
+    is_unconditional_jump(id)
+        || is_conditional_jump(id)
+        || id == X86Insn::X86_INS_RET as u32
+}
 
-    if is_conditional_jump(id) {
-        return true;
+/// Extract immediate target of a jump instruction
+fn extract_imm(cs: &Capstone, insn: &Insn) -> Option<u64> {
+    if let Some(detail) = cs.insn_detail(insn).ok() {
+        if let capstone::arch::ArchDetail::X86Detail(d) = detail.arch_detail() {
+            for op in d.operands() {
+                if let X86OperandType::Imm(imm) = op.op_type {
+                    return Some(imm as u64);
+                }
+            }
+        }
     }
-
-    id == capstone::arch::x86::X86Insn::X86_INS_RET as u32
+    None
 }
 
 fn main() {
-    let cs = capstone::Capstone::new()
+    // Initialize Capstone
+    let cs = Capstone::new()
         .x86()
         .mode(capstone::arch::x86::ArchMode::Mode64)
         .syntax(capstone::arch::x86::ArchSyntax::Intel)
         .detail(true)
         .build()
-        .expect("Falied to build capstone");
+        .expect("Failed to build Capstone");
 
+    // Read binary .text section (user implements read_text_section)
     let base_addr = 0x1000;
     let code = read_binary::read_text_section(Path::new("test")).expect("Failed to read text section");
-    let insns = cs.disasm_all(&code, base_addr)
-        .expect("Failed to disassemble");
+    let insns = cs.disasm_all(&code, base_addr).expect("Failed to disassemble");
 
-    let mut direct_labels = Vec::new(); // 即値アドレス (e.g, 0x1000)
-    let mut indirect_labels = Vec::new(); // 間接アドレス (e.g, rax)
-
-    analyze_instructions(&cs, &insns, &mut direct_labels, &mut indirect_labels);
-
-    let mut basic_blocks: Vec<BasicBlock> = Vec::new();
-    let labels: Vec<_> = direct_labels.iter().collect();  // 参照のコレクションを作成
-
-    // base addrをブロックとして追加 
-    basic_blocks.push(BasicBlock {
-        start_address: base_addr,
-        end_address: 0,
-        instructions: Vec::new(),
-    });
-
-    // ブロックの開始アドレスを設定
-    for (_, op_str) in &labels {
-        let addr = u64::from_str_radix(&op_str[2..], 16).unwrap();
-        basic_blocks.push(BasicBlock {
-            start_address: addr,
-            end_address: 0,
-            instructions: Vec::new(),
-        });
+    // 1. Collect block start labels
+    let mut labels = HashSet::new();
+    labels.insert(base_addr);
+    for insn in insns.as_ref() {
+        let id = insn.id().0;
+        if is_unconditional_jump(id) || is_conditional_jump(id) {
+            if let Some(target) = extract_imm(&cs, insn) {
+                labels.insert(target);
+            }
+            if is_conditional_jump(id) {
+                // fall-through
+                labels.insert(insn.address() + insn.bytes().len() as u64);
+            }
+        }
     }
 
-    // ブロックの終了アドレスを設定
-    for i in 0..basic_blocks.len() - 1 {
-        let (left, right) = basic_blocks.split_at_mut(i + 1);
-        left[i].end_address = right[0].start_address;
+    // Sort labels
+    let mut starts: Vec<u64> = labels.into_iter().collect();
+    starts.sort_unstable();
+
+    // 2. Build basic blocks with adjacent ranges
+    let mut blocks: Vec<BasicBlock> = starts
+        .windows(2)
+        .map(|w| BasicBlock { start: w[0], end: w[1], instructions: Vec::new() })
+        .collect();
+    // last block to end of section or last insn + size
+    if let Some(last) = starts.last() {
+        let end = insns.as_ref().last()
+            .map(|i| i.address() + i.bytes().len() as u64)
+            .unwrap_or(*last);
+        blocks.push(BasicBlock { start: *last, end, instructions: Vec::new() });
     }
 
-    // ブロックの命令列を設定
-    for (_, op_str) in &labels {
-        let addr = u64::from_str_radix(&op_str[2..], 16).unwrap();
-        for block in &mut basic_blocks {
-            if block.start_address <= addr && addr < block.end_address {
-                for insn in insns.as_ref() {
-                    if block.start_address <= insn.address() && insn.address() < block.end_address {
-                        block.instructions.push(insn);
-                        if is_terminator(insn.id().0) {
-                            block.end_address = insn.address();
-                            break;
-                        }
-                    }
-                }
+    // 3. Linear scan to fill instructions per block
+    let mut iter = insns.as_ref().iter().peekable();
+    for block in &mut blocks {
+        while let Some(&insn) = iter.peek() {
+            if insn.address() >= block.end {
+                break;
+            }
+            block.instructions.push(insn);
+            iter.next();
+            if is_terminator(insn.id().0) {
                 break;
             }
         }
     }
 
-    for block in basic_blocks {
-        print_basic_block(&block);
+    // 4. Generate CFG edges
+    let mut graph = Graph::<u64, (), Directed>::new();
+    let mut idx_map = HashMap::new();
+    for block in &blocks {
+        let idx = graph.add_node(block.start);
+        idx_map.insert(block.start, idx);
     }
-
-
-
-}
-
-fn print_basic_block(block: &BasicBlock) {
-    println!("\nBasic Block: --------------------------------");
-    println!("Start Address: 0x{:x}", block.start_address);
-    println!("End Address: 0x{:x}", block.end_address);
-    println!("Instructions: --------------------------------");
-    for insn in &block.instructions {
-        println!("0x{:x}: {} {}", insn.address(), insn.mnemonic().unwrap_or("unknown"), insn.op_str().unwrap_or("unknown"));
-    }
-}
-
-fn analyze_instructions(
-    cs: &capstone::Capstone,
-    insns: &capstone::Instructions,
-    direct_labels: &mut Vec<(String, String)>,
-    indirect_labels: &mut Vec<(String, String)>,
-) {
-    for insn in insns.as_ref() {
-        let mnemonic = insn.mnemonic().unwrap_or("unknown").to_string();
-        let op_str   = insn.op_str().unwrap_or("unknown").to_string();
-
-        // 命令詳細とグループ名の取得
-        let detail = cs.insn_detail(insn).expect("Failed to get instruction detail");
-        let groups: Vec<_> = detail
-            .groups()
-            .iter()
-            .filter_map(|&g| cs.group_name(g))
-            .map(|s| s.to_string())
-            .collect();
-
-        // “jump” グループに属していればラベル扱い
-        if groups.contains(&"jump".to_string()) {
-            if op_str.starts_with("0x") {
-                // 1) 即値アドレスへのジャンプ先
-                direct_labels.push((mnemonic.clone(), op_str.clone()));
-
-                // 2) 条件ジャンプの場合は「フォールスルー先」も追加
-                //    無条件ジャンプ (jmp) は除外
-                if mnemonic != "jmp" && mnemonic.starts_with('j') {
-                    let fall_addr = insn.address() + insn.bytes().len() as u64;
-                    let fall_str  = format!("0x{:x}", fall_addr);
-                    direct_labels.push(("fall".into(), fall_str));
+    for block in &blocks {
+        if let Some(term) = block.instructions.last() {
+            let id = term.id().0;
+            // Jump targets
+            if is_unconditional_jump(id) {
+                if let Some(tgt) = extract_imm(&cs, term) {
+                    if let (Some(&s), Some(&d)) = (idx_map.get(&block.start), idx_map.get(&tgt)) {
+                        graph.add_edge(s, d, ());
+                    }
                 }
-            } else {
-                // 間接ジャンプ
-                indirect_labels.push((mnemonic.clone(), op_str.clone()));
+            } else if is_conditional_jump(id) {
+                if let Some(tgt) = extract_imm(&cs, term) {
+                    let fall = term.address() + term.bytes().len() as u64;
+                    if let Some(&s) = idx_map.get(&block.start) {
+                        if let Some(&d1) = idx_map.get(&tgt) {
+                            graph.add_edge(s, d1, ());
+                        }
+                        if let Some(&d2) = idx_map.get(&fall) {
+                            graph.add_edge(s, d2, ());
+                        }
+                    }
+                }
             }
         }
     }
 
-    // 重複排除
-    direct_labels.sort_by(|a, b| a.1.cmp(&b.1));
-    direct_labels.dedup();
-    indirect_labels.sort_by(|a, b| a.1.cmp(&b.1));
-    indirect_labels.dedup();
+    // Print blocks and edges in Mermaid
+    println!("```mermaid");
+    println!("graph TD");
 
-    // 確認出力
-    println!("\nDirect Labels: --------------------------------\n");
-    for (m, o) in direct_labels {
-        println!("{} {}", m, o);
+    for block in &blocks {
+        let node_id = format!("B{:x}", block.start);
+        let label = block.instructions.iter()
+            .map(|insn| {
+                let m = insn.mnemonic().unwrap_or("").replace('"', "\\\"");
+                let o = insn.op_str().unwrap_or("").replace('"', "\\\"");
+                format!("{} {}", m, o)
+            })
+            .collect::<Vec<_>>()
+            .join("<br>");
+        println!("    {}[\"0x{:x}:<br>{}\"]", node_id, block.start, label);
     }
-    println!("\nIndirect Labels: --------------------------------\n");
-    for (m, o) in indirect_labels {
-        println!("{} {}", m, o);
+
+    for edge in graph.raw_edges() {
+        let src_id = format!("B{:x}", graph[edge.source()]);
+        let dst_id = format!("B{:x}", graph[edge.target()]);
+        println!("    {} --> {}", src_id, dst_id);
     }
+
+    println!("```");
 }
